@@ -5816,6 +5816,7 @@ def image_to_axion_pic(img:Image.Image)->bytes:
 
     Data is compatible with AIRPORT.PIC: byte 0 is bytes-per-column; each column
     stores 8-row chunks bottom-chunk first, with bit 0 at the top of each chunk.
+    For non-byte-aligned heights, unused rows are the top of the final chunk.
     """
     if img.mode!='1':
         # exact color cannot be represented by monochrome .PIC
@@ -5826,10 +5827,17 @@ def image_to_axion_pic(img:Image.Image)->bytes:
     w,h=img.size
     bpc=(h+7)//8
     if not (1<=bpc<=255): raise ValueError('PIC height out of range')
+    if h % 8:
+        # Axion reads every byte as a full 8-dot chunk.  Keep padding above the
+        # image so a 14-dot sign occupies the same bottom-aligned rows as its
+        # configured display, rather than shifting the result vertically.
+        aligned=Image.new('1',(w,bpc*8),0)
+        aligned.paste(img,(0,bpc*8-h))
+        img=aligned
     px=img.load(); out=bytearray([bpc])
     for x in range(w):
         col=[0]*bpc
-        for y in range(h):
+        for y in range(img.height):
             if px[x,y]:
                 chunk=y//8; stored=bpc-1-chunk
                 col[stored] |= 1 << (y%8)
@@ -5845,13 +5853,16 @@ def _ci(root:Path,name:str)->Path:
 def inspect_template(dbdir:Path):
     aff=DbfTemplate(_ci(dbdir,'Affichrs.DBF')).active_records()
     cfg=DbfTemplate(_ci(dbdir,'Configs.DBF')).active_records()
+    emp=DbfTemplate(_ci(dbdir,'Emplacem.DBF')).active_records()
     aff_by={int(r['AFF_ID']):r for r in aff if r.get('AFF_ID') is not None}
+    location_by_id={int(r['EMP_ID']):str(r.get('EMPL') or '') for r in emp if r.get('EMP_ID') is not None}
     sources=[]
     for r in cfg:
         a=aff_by.get(int(r['AFF_ID']))
         if not a: continue
         sources.append(dict(src=int(r['SRC_ID']),cfg=int(r['CFG_ID']),aff=int(r['AFF_ID']),empl=int(r['EMPL_ID']),
-                            w=int(a['DIMH']),h=int(a['DIMV']),type=a['TYPE'],name=a['AFF_NAME']))
+                            location=location_by_id.get(int(r['EMPL_ID']),''),w=int(a['DIMH']),h=int(a['DIMV']),
+                            type=a['TYPE'],address=a['ADRIDENTIF'],name=a['AFF_NAME']))
     return sorted(sources,key=lambda r:r['src'])
 
 def _extract_builtin_template(dst:Path)->Tuple[Path,Path]:
@@ -5911,7 +5922,8 @@ def _alloc_addr(used:set[str])->str:
             used.add(v); return v
     return 'FF'
 
-def ensure_axion_displays(dbdir:Path, sign_specs:List[Tuple[str,int,int,bool]]):
+def ensure_axion_displays(dbdir:Path, sign_specs:List[Dict[str,Any]],
+                          sign_overrides:Optional[Dict[int,Dict[str,Any]]]=None):
     """Ensure every Luminator matrix logical sign has an Axion source of equal dimensions.
 
     Known logical roles reuse the normal DataTransit placements (Front, Rear, Curb Side,
@@ -5923,16 +5935,23 @@ def ensure_axion_displays(dbdir:Path, sign_specs:List[Tuple[str,int,int,bool]]):
     cfg_tpl=DbfTemplate(_ci(dbdir,'Configs.DBF')); cfg=cfg_tpl.active_records()
     emp=DbfTemplate(_ci(dbdir,'Emplacem.DBF')).active_records()
     emp_by_name={str(r.get('EMPL') or '').strip().upper():int(r['EMP_ID']) for r in emp if r.get('EMP_ID') is not None}
-    cfg_by_empl={int(r['EMPL_ID']):r for r in cfg if r.get('EMPL_ID') is not None}
+    emp_name_by_id={value:key for key,value in emp_by_name.items()}
+    sign_overrides=sign_overrides or {}
     used_src={int(r['SRC_ID']) for r in cfg if r.get('SRC_ID') is not None}
     used_addr={str(r.get('ADRIDENTIF') or '').upper() for r in aff}
     next_aff=max([int(r['AFF_ID']) for r in aff if r.get('AFF_ID') is not None] or [0])+1
     next_cfg=max([int(r['CFG_ID']) for r in cfg if r.get('CFG_ID') is not None] or [0])+1
     next_src=max(used_src or {0})+1
 
-    role_names={
-        'FRONT':'FRONT','REAR':'REAR','SIDE1':'CURB SIDE','SIDE2':'ROUTE SIDE',
-    }
+    def preferred_locations(name:str)->List[str]:
+        """Return semantic Axion location preferences from an IPS logical-sign name."""
+        normalized=''.join(ch for ch in name.upper() if ch.isalnum())
+        if 'FRONT' in normalized: return ['FRONT']
+        if 'REAR' in normalized: return ['REAR']
+        if 'CURB' in normalized or normalized.endswith('SIDE1'): return ['CURB SIDE']
+        if 'ROUTE' in normalized or normalized.endswith('SIDE2'): return ['ROUTE SIDE']
+        if 'SIDE' in normalized: return ['CURB SIDE','ROUTE SIDE']
+        return []
     # Every non-ODK logical sign gets its own Axion source. Prefer generic
     # placements for nonstandard signs, then use any still-free matrix placement.
     # Control Console is reserved for ODK text.
@@ -5940,17 +5959,22 @@ def ensure_axion_displays(dbdir:Path, sign_specs:List[Tuple[str,int,int,bool]]):
         'AUXILIARY 1','AUXILIARY 2','NEXT STOP','PUBLIC INTEREST','KEY NUMBER',
         'FRONT','REAR','CURB SIDE','ROUTE SIDE',
     ]
-    claimed=set()
-    sign_to_src={}; created=[]; changed=[]
+    sign_to_src={}; created=[]; changed=[]; assigned_src=set()
 
     aff_by_id={int(r['AFF_ID']):r for r in aff if r.get('AFF_ID') is not None}
 
-    def choose_aff(w,h,is_color,preferred_id=None):
+    def choose_aff(w,h,is_color,preferred_id=None,address='',display_type='M'):
         nonlocal next_aff
+        display_type=str(display_type or 'M').upper()
+        if display_type not in ('C','H','M','P','S'):
+            raise ValueError(f'Unsupported Axion display type {display_type!r}')
+        address=str(address or '').strip().upper()
+        if address and (len(address)!=2 or any(ch not in '0123456789ABCDEF' for ch in address)):
+            raise ValueError(f'Axion display address must be two hexadecimal characters, got {address!r}')
         pref=aff_by_id.get(int(preferred_id)) if preferred_id is not None else None
-        if pref and int(pref.get('DIMH') or 0)==w and int(pref.get('DIMV') or 0)==h and (not is_color or 'COLOR SIGN' in str(pref.get('AFF_NAME') or '').upper()):
+        if pref and int(pref.get('DIMH') or 0)==w and int(pref.get('DIMV') or 0)==h and str(pref.get('TYPE') or '')==display_type and (not address or str(pref.get('ADRIDENTIF') or '').upper()==address) and (not is_color or 'COLOR SIGN' in str(pref.get('AFF_NAME') or '').upper()):
             return int(pref['AFF_ID'])
-        matches=[r for r in aff if int(r.get('DIMH') or 0)==w and int(r.get('DIMV') or 0)==h and str(r.get('TYPE') or '') in ('M','P','S')]
+        matches=[r for r in aff if int(r.get('DIMH') or 0)==w and int(r.get('DIMV') or 0)==h and str(r.get('TYPE') or '')==display_type and (not address or str(r.get('ADRIDENTIF') or '').upper()==address)]
         if is_color:
             cm=[r for r in matches if 'COLOR SIGN' in str(r.get('AFF_NAME') or '').upper()]
             if cm: return int(cm[0]['AFF_ID'])
@@ -5958,43 +5982,150 @@ def ensure_axion_displays(dbdir:Path, sign_specs:List[Tuple[str,int,int,bool]]):
         elif matches:
             mono=[r for r in matches if 'COLOR SIGN' not in str(r.get('AFF_NAME') or '').upper()]
             return int((mono or matches)[0]['AFF_ID'])
-        rec=dict(AFF_ID=next_aff,TYPE='M',DIMH=w,DIMV=h,ADRIDENTIF=_alloc_addr(used_addr),
-                 AFF_NAME=(f'Color Sign {h}x{w}' if is_color else f'Auto Matrix {h}x{w}')[:30],
+        if address and address in used_addr:
+            raise ValueError(f'Axion address {address} is already assigned to an incompatible display profile')
+        addr=address or _alloc_addr(used_addr)
+        used_addr.add(addr)
+        rec=dict(AFF_ID=next_aff,TYPE=display_type,DIMH=w,DIMV=h,ADRIDENTIF=addr,
+                 AFF_NAME=(f'Color Sign {h}x{w}' if is_color else f'1-LED {h}x{w}')[:30],
                  LED_WARN=101,NOPATTERN=None,COLOREND=None)
         aff.append(rec); aff_by_id[int(rec['AFF_ID'])]=rec; created.append(rec.copy()); next_aff+=1
         return int(rec['AFF_ID'])
 
-    ordered=sorted(sign_specs,key=lambda x:(0 if x[0].upper()=='FRONT' else 1 if x[0].upper()=='REAR' else 2 if x[0].upper().startswith('SIDE') else 3,x[0]))
-    for name,w,h,is_color in ordered:
-        up=name.upper()
-        place=role_names.get(up)
-        if place and place in claimed: place=None
+    ordered=sorted(sign_specs,key=lambda x:(0 if x['name'].upper()=='FRONT' else 1 if x['name'].upper()=='REAR' else 2 if x['name'].upper().startswith('SIDE') else 3,x['id']))
+    for spec in ordered:
+        sign_id=int(spec['id']); name=str(spec['name']); w=int(spec['width']); h=int(spec['height']); is_color=bool(spec['is_color'])
+        override=sign_overrides.get(sign_id,{})
+        address=str(override.get('address') or '').strip().upper()
+        display_type=str(override.get('type') or '').upper()
+        display_value=str(override.get('display') or '').strip()
+        display_override=int(display_value) if display_value else None
+        source_value=str(override.get('source') or '').strip()
+        source_override=int(source_value) if source_value else None
+        if source_override is not None and source_override in assigned_src:
+            raise ValueError(f'Axion source ID {source_override} is assigned to more than one IPS logical sign')
+        existing=next((r for r in cfg if source_override is not None and int(r.get('SRC_ID') or -1)==source_override),None)
+        location=str(override.get('location') or '').strip().upper()
+        if location and location not in emp_by_name:
+            raise ValueError(f'Unknown Axion location {location!r}')
+        place=location
+        if existing:
+            place=place or next((key for key,value in emp_by_name.items() if value==int(existing['EMPL_ID'])),None)
+        # IPS physical addresses are fleet-specific, so never translate their
+        # numeric value to an Axion source.  Prefer a configured exact-size
+        # output, ranking semantic locations ahead of generic outputs.
         if not place:
-            place=next((x for x in fallback if x not in claimed and x in emp_by_name),None)
+            role_places=preferred_locations(name)
+            exact=[]
+            for candidate in cfg:
+                candidate_src=int(candidate.get('SRC_ID') or -1)
+                candidate_place=emp_name_by_id.get(int(candidate.get('EMPL_ID') or -1),'')
+                profile=aff_by_id.get(int(candidate.get('AFF_ID') or -1),{})
+                if candidate_src in assigned_src:
+                    continue
+                if (int(profile.get('DIMH') or 0),int(profile.get('DIMV') or 0))==(w,h):
+                    exact.append(candidate)
+            if exact:
+                exact.sort(key=lambda candidate:(
+                    role_places.index(emp_name_by_id.get(int(candidate.get('EMPL_ID') or -1),''))
+                    if emp_name_by_id.get(int(candidate.get('EMPL_ID') or -1),'') in role_places else len(role_places),
+                    int(candidate['SRC_ID'])))
+                place=emp_name_by_id[int(exact[0]['EMPL_ID'])]
+            elif role_places:
+                place=next((candidate for candidate in role_places if candidate in emp_by_name),None)
+        if not place:
+            place=next((x for x in fallback if x in emp_by_name),None)
         if not place:
             raise ValueError(f'No free Axion display placement is available for logical sign {name} ({w}x{h})')
-        claimed.add(place); empl_id=emp_by_name[place]
-        current=cfg_by_empl.get(empl_id)
-        aff_id=choose_aff(w,h,is_color,current.get('AFF_ID') if current else None)
-        if empl_id in cfg_by_empl:
-            r=cfg_by_empl[empl_id]
+        empl_id=emp_by_name[place]
+        candidates=[r for r in cfg if int(r.get('EMPL_ID') or -1)==empl_id and int(r.get('SRC_ID') or -1) not in assigned_src]
+        current=existing
+        if current is None and source_override is None:
+            current=next((r for r in candidates if (aff_by_id.get(int(r.get('AFF_ID') or -1),{}).get('DIMH'),aff_by_id.get(int(r.get('AFF_ID') or -1),{}).get('DIMV'))==(w,h)),None) or (candidates[0] if candidates else None)
+        if not display_type and current:
+            display_type=str(aff_by_id.get(int(current.get('AFF_ID') or -1),{}).get('TYPE') or 'M').upper()
+        if not display_type:
+            display_type='M'
+        if display_override is not None:
+            requested=aff_by_id.get(display_override)
+            if not requested:
+                raise ValueError(f'Axion display profile {display_override} does not exist')
+            if (int(requested.get('DIMH') or 0),int(requested.get('DIMV') or 0)) != (w,h):
+                raise ValueError(f'Axion display profile {display_override} does not match IPS sign {name} ({w}x{h})')
+            aff_id=display_override
+        else:
+            aff_id=choose_aff(w,h,is_color,current.get('AFF_ID') if current else None,address,display_type)
+        if current:
+            r=current
+            r['EMPL_ID']=empl_id
             old=int(r.get('AFF_ID') or 0); r['AFF_ID']=aff_id
             src=int(r['SRC_ID'])
             if old!=aff_id: changed.append((name,src,old,aff_id,w,h,is_color))
         else:
-            while next_src in used_src: next_src+=1
-            r=dict(CFG_ID=next_cfg,SYS_ID=1,AFF_ID=aff_id,EMPL_ID=empl_id,SRC_ID=next_src,GAUCHE=10,TOP=10,LED='')
-            cfg.append(r); cfg_by_empl[empl_id]=r; used_src.add(next_src)
-            src=next_src; next_src+=1; next_cfg+=1
+            src=source_override if source_override is not None else next_src
+            if src in used_src:
+                raise ValueError(f'Axion source ID {src} already exists')
+            while next_src in used_src or next_src==src: next_src+=1
+            r=dict(CFG_ID=next_cfg,SYS_ID=1,AFF_ID=aff_id,EMPL_ID=empl_id,SRC_ID=src,GAUCHE=10,TOP=10,LED='')
+            cfg.append(r); used_src.add(src); next_cfg+=1
             changed.append((name,src,None,aff_id,w,h,is_color))
-        sign_to_src[name]=src
+        assigned_src.add(src)
+        sign_to_src[sign_id]=src
 
     aff_tpl.write_records(_ci(dbdir,'Affichrs.DBF'),aff, production_mdx=True)
     cfg_tpl.write_records(_ci(dbdir,'Configs.DBF'),cfg, production_mdx=True)
     return sign_to_src,created,changed
 
 # ---- conversion -----------------------------------------------------------
-def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
+IPS_PR_MESSAGE_CLASS = 2
+IPS_DESTINATION_MESSAGE_CLASS = 3
+IPS_SPECIAL_MESSAGE_CLASS = 1
+
+
+def _ips_special_class_a_codes(core, ips:Path)->Dict[int,Tuple[str,int,str]]:
+    """Find IPS class-A emergency/yield codes and return their Axion route metadata."""
+    database=core.Jet3Reader(ips)
+    text_by_code={}
+    tables=(
+        (('MsgCode','MsgClassID','Title','Text'),('Title','Text')),
+        (('MsgFrameID','MsgCode','LSignID','Phrase','FontID','XPos','YPos','Frame'),('Phrase',)),
+    )
+    for required_fields,text_fields in tables:
+        try:
+            table=database.find_table(*required_fields)
+        except KeyError:
+            continue
+        for row in database.rows(table):
+            if int(row.get('MsgClassID') or 0)!=IPS_SPECIAL_MESSAGE_CLASS or row.get('MsgCode') is None:
+                continue
+            code=int(row['MsgCode'])
+            text_by_code.setdefault(code,[]).extend(str(row.get(field) or '') for field in text_fields)
+    special={}
+    for code,texts in text_by_code.items():
+        text=' '.join(texts).upper()
+        if 'EMERGENCY' in text:
+            special[code]=('ZZZZ',9998,'ZZZZ')
+        elif 'YIELD' in text:
+            special[code]=('$YLD',9997,'$YLD')
+    return special
+
+
+def _axion_pr_code(code: int) -> str:
+    """Return Axion's four-character route ID for an IPS class-B PR code."""
+    return f'ZZ{code:02d}'
+
+
+def _is_odk_sign(name:Any, width:Any=None, height:Any=None)->bool:
+    """Return whether an IPS logical sign belongs to the Control Console."""
+    try:
+        is_console_size=(int(width),int(height))==(100,14)
+    except (TypeError,ValueError):
+        is_console_size=False
+    return str(name or '').strip().upper().startswith('ODK') or is_console_size
+
+
+def convert(ips:Path, out_zip:Path, *, seconds:int=2,
+            sign_overrides:Optional[Dict[int,Dict[str,Any]]]=None,
             index_mode:str='rebuild', progress_callback=None)->Dict[str,Any]:
     def _progress(value, message=''):
         if progress_callback:
@@ -6004,6 +6135,7 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
                 pass
 
     _progress(0, 'Loading converter…')
+    sign_overrides=sign_overrides or {}
     core=_load_renderer()
     temp=Path(tempfile.mkdtemp(prefix='lum2axion_'))
     try:
@@ -6033,35 +6165,55 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
         _progress(45, 'Reading rendered sign manifest…')
         with (rend/'manifest.tsv').open(encoding='utf-8') as f:
             manifest=list(csv.DictReader(f,delimiter='\t'))
+        special_class_a_codes=_ips_special_class_a_codes(core,ips)
 
         # Determine matrix logical signs and whether each one really needs color.
-        sign_dims={}
+        sign_specs_by_id={}
         sign_color={}
         manifest_total=max(1,len(manifest))
         for manifest_i,row in enumerate(manifest,start=1):
             if manifest_i == 1 or manifest_i == manifest_total or manifest_i % max(1,manifest_total//50) == 0:
                 _progress(45 + 4*(manifest_i/manifest_total), f'Analyzing sign {manifest_i:,} of {manifest_total:,}…')
-            if int(row['msg_class'])!=msg_class: continue
-            n=row['logical_sign']; w=int(row['width']); h=int(row['height'])
-            if n.upper()=='ODK': continue
-            sign_dims[n]=(w,h)
-            if not sign_color.get(n,False):
+            ips_class=int(row['msg_class']); ips_code=int(row['msg_code'])
+            if ips_class not in (IPS_DESTINATION_MESSAGE_CLASS, IPS_PR_MESSAGE_CLASS) and not (ips_class==IPS_SPECIAL_MESSAGE_CLASS and ips_code in special_class_a_codes): continue
+            sign_id=int(row['logical_sign_id']); n=row['logical_sign']; w=int(row['width']); h=int(row['height'])
+            if _is_odk_sign(n,w,h): continue
+            if sign_overrides.get(sign_id,{}).get('discard'): continue
+            sign_specs_by_id[sign_id]=dict(id=sign_id,name=n,width=w,height=h,is_color=False)
+            if not sign_color.get(sign_id,False):
                 with Image.open(rend/row['relative_path']) as im:
-                    sign_color[n]=_image_is_multicolor(im)
-        sign_specs=[(n,w,h,bool(sign_color.get(n))) for n,(w,h) in sign_dims.items()]
+                    sign_color[sign_id]=_image_is_multicolor(im)
+        sign_specs=[]
+        for sign_id,spec in sign_specs_by_id.items():
+            spec['is_color']=bool(sign_color.get(sign_id))
+            sign_specs.append(spec)
         _progress(50, 'Creating matching Axion display definitions…')
-        sign_to_src,created_aff,changed_cfg=ensure_axion_displays(dbdir,sign_specs)
+        sign_to_src,created_aff,changed_cfg=ensure_axion_displays(dbdir,sign_specs,sign_overrides)
         sources=inspect_template(dbdir)
         src_by_id={s['src']:s for s in sources}
 
-        # Index every rendered exposure directly by its logical-sign source.
+        # Index destination, PR, emergency, and yield codes by logical-sign source.
+        # DataTransit represents PR code 1 as ZZ01, rather than route number 1.
         selected={}
+        route_codes={}
         _progress(52, 'Indexing rendered exposures…')
         for row in manifest:
-            if int(row['msg_class'])!=msg_class: continue
-            n=row['logical_sign']
-            if n not in sign_to_src: continue
-            src=sign_to_src[n]; code=int(row['msg_code']); exp=int(row['exposure'])
+            ips_class=int(row['msg_class'])
+            ips_code=int(row['msg_code'])
+            if ips_class not in (IPS_DESTINATION_MESSAGE_CLASS, IPS_PR_MESSAGE_CLASS) and not (ips_class==IPS_SPECIAL_MESSAGE_CLASS and ips_code in special_class_a_codes): continue
+            sign_id=int(row['logical_sign_id'])
+            if sign_overrides.get(sign_id,{}).get('discard'): continue
+            if sign_id not in sign_to_src: continue
+            src=sign_to_src[sign_id]; exp=int(row['exposure'])
+            if ips_class == IPS_PR_MESSAGE_CLASS:
+                code=_axion_pr_code(ips_code)
+                route_codes[code]=(9999 + ips_code, code)
+            elif ips_class == IPS_SPECIAL_MESSAGE_CLASS:
+                code,num_id,letter=special_class_a_codes[ips_code]
+                route_codes[code]=(num_id, letter)
+            else:
+                code=str(ips_code)
+                route_codes[code]=(ips_code, '')
             p=rend/row['relative_path']
             with Image.open(p) as im:
                 selected[(code,src,exp)]=(row,im.copy(),src_by_id[src])
@@ -6073,14 +6225,16 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
             src_db=core.Jet3Reader(ips)
             sign_td=src_db.find_table('LSignID','LSignName','LSignDotHeight','LSignDotWidth')
             msg_td=src_db.find_table('MsgFrameID','MsgCode','LSignID','Phrase','FontID','XPos','YPos','Frame')
-            odk_ids={r['LSignID'] for r in src_db.rows(sign_td) if str(r.get('LSignName') or '').upper()=='ODK'}
+            odk_ids={r['LSignID'] for r in src_db.rows(sign_td) if _is_odk_sign(r.get('LSignName'),r.get('LSignDotWidth'),r.get('LSignDotHeight'))}
             odk_groups={}
             for r in src_db.rows(msg_td):
-                if int(r.get('MsgClassID') or 0)!=msg_class or r.get('LSignID') not in odk_ids: continue
+                ips_class=int(r.get('MsgClassID') or 0); ips_code=int(r.get('MsgCode') or 0)
+                if (ips_class!=IPS_DESTINATION_MESSAGE_CLASS and not (ips_class==IPS_SPECIAL_MESSAGE_CLASS and ips_code in special_class_a_codes)) or r.get('LSignID') not in odk_ids: continue
                 code=r.get('MsgCode'); frame=r.get('Frame')
                 if code is None or frame is None: continue
                 phrase=str(r.get('Phrase') or '').strip()
-                if phrase: odk_groups.setdefault((int(code),int(frame)),[]).append(r)
+                axion_code=special_class_a_codes[ips_code][0] if ips_class==IPS_SPECIAL_MESSAGE_CLASS else str(int(code))
+                if phrase: odk_groups.setdefault((axion_code,int(frame)),[]).append(r)
             by_code={}
             for (code,frame),parts in odk_groups.items():
                 parts=sorted(parts,key=lambda r:((r.get('YPos') or 1),(r.get('XPos') or 1),(r.get('MsgFrameID') or 0)))
@@ -6094,12 +6248,17 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
             odk_rows=[]
 
         _progress(57, 'Preparing Axion route codes…')
-        codes=sorted(set(k[0] for k in selected) | {int(r['LST_ID'].split('P',1)[1].split('S',1)[0]) for r in odk_rows})
+        special_route_codes={axion_code:(num_id,letter) for axion_code,num_id,letter in special_class_a_codes.values()}
+        for row in odk_rows:
+            code=str(row['LST_ID'].split('P',1)[1].split('S',1)[0])
+            if code not in route_codes:
+                route_codes[code]=special_route_codes[code] if code in special_route_codes else (int(code),'')
+        codes=sorted(set(k[0] for k in selected) | set(route_codes))
         parcours_tpl=DbfTemplate(_ci(dbdir,'Parcours.DBF'))
         prcr_field=next(f for f in parcours_tpl.fields if f.name=='PRCR_ID')
         unrepresentable=[c for c in codes if len(str(c))>prcr_field.length]
         codes=[c for c in codes if c not in unrepresentable]; allowed_codes=set(codes)
-        odk_rows=[r for r in odk_rows if int(r['LST_ID'].split('P',1)[1].split('S',1)[0]) in allowed_codes]
+        odk_rows=[r for r in odk_rows if r['LST_ID'].split('P',1)[1].split('S',1)[0] in allowed_codes]
 
         msg_rows=[]; seq_rows=[]; pic_count=0; color_count=0; mono_count=0
         total_pics=sum(1 for (code,src,exp) in selected if code in allowed_codes)
@@ -6112,7 +6271,7 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
                 lst=f'R1P{code}S{src}'
                 for seq_idx,exp in enumerate(exps):
                     row,img,_=selected[(code,src,exp)]
-                    is_color=bool(sign_color.get(row['logical_sign'],False))
+                    is_color=bool(sign_color.get(int(row['logical_sign_id']),False))
                     if is_color:
                         # DataTransit stores color-sign pictograms in a dedicated
                         # subdirectory and browses only *.bmp there.  The MSG field
@@ -6143,7 +6302,8 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
                         _progress(60 + 28*(done_pics/max(1,total_pics)), f'Generating pictogram {done_pics:,} of {total_pics:,}…')
 
         _progress(89, 'Writing Axion database tables…')
-        parcours=[dict(PRCR_ID=str(c),RES_ID=1,DEPENDANT=True,NUM_ID=c,LETTRE='',ALLOWRTNUM=False) for c in codes]
+        parcours=[dict(PRCR_ID=code,RES_ID=1,DEPENDANT=True,NUM_ID=route_codes[code][0],
+                   LETTRE=route_codes[code][1],ALLOWRTNUM=False) for code in codes]
         parcours_tpl.write_records(_ci(dbdir,'Parcours.DBF'),parcours, production_mdx=True)
         DbfTemplate(_ci(dbdir,'Msgmatri.DBF')).write_records(_ci(dbdir,'Msgmatri.DBF'),msg_rows, production_mdx=True)
         DbfTemplate(_ci(dbdir,'Sequence.DBF')).write_records(_ci(dbdir,'Sequence.DBF'),seq_rows, production_mdx=True)
@@ -6167,12 +6327,13 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
         report=dbdir.parent/'CONVERSION_REPORT.txt'
         report.write_text(
             'Luminator -> Axion conversion\n'
-            f'Source IPS: {ips.name}\nTemplate: embedded Axion/DataTransit skeleton\nMessage class: {msg_class}\nExposure seconds: {seconds}\n\n'
+            f'Source IPS: {ips.name}\nTemplate: embedded Axion/DataTransit skeleton\nIPS message classes: B (PR) and C (destination)\nExposure seconds: {seconds}\n\n'
             'Logical sign -> Axion source mapping:\n' + ''.join(
-                f'  {n}: {sign_dims[n][0]}x{sign_dims[n][1]} -> S{src} ({src_by_id[src]["name"]})\n' for n,src in sorted(sign_to_src.items())) +
-            f'\nAxion route codes written: {len(codes)}\nPictograms written: {pic_count}\nMonochrome PIC: {mono_count}\nColor BMP: {color_count}\n'
+                f'  L{sign_id} {sign_specs_by_id[sign_id]["name"]}: {sign_specs_by_id[sign_id]["width"]}x{sign_specs_by_id[sign_id]["height"]} -> S{src} ({src_by_id[src]["name"]})\n' for sign_id,src in sorted(sign_to_src.items())) +
+            f'\nAxion route codes written: {len(codes)} (including {sum(code.startswith("ZZ") for code in codes)} PR codes)\nPictograms written: {pic_count}\nMonochrome PIC: {mono_count}\nColor BMP: {color_count}\n'
             f'MSGMATRI rows: {len(msg_rows)}\nSEQUENCE rows: {len(seq_rows)}\nControl Console rows: {len(odk_rows)}\nColor pictogram folder: PICTOGRAM\\ColorSignPictogram\\\n'
             f'Codes exceeding PRCR_ID width and skipped: {unrepresentable}\n'
+            f'Discarded IPS logical signs: {[sign_id for sign_id,override in sorted(sign_overrides.items()) if override.get("discard")]}\n'
             f'New AFFICHRS display definitions: {len(created_aff)}\nChanged/added CONFIGS entries: {len(changed_cfg)}\n\n'
             'INDEX NOTE:\nProduction MDX indexes were rebuilt to match the generated DBF records (including LST_ID/RANG/SEQINDEX tags).\n',
             encoding='utf-8')
@@ -6182,11 +6343,23 @@ def convert(ips:Path, out_zip:Path, *, msg_class:int=3, seconds:int=2,
         zip_files=[p for p in sorted(temp.rglob('*')) if p.is_file()]
         zip_total=max(1,len(zip_files))
         _progress(96, f'Packaging {len(zip_files):,} files into ZIP…')
-        with zipfile.ZipFile(out_zip,'w',zipfile.ZIP_DEFLATED) as z:
-            for zip_i,p in enumerate(zip_files,start=1):
-                z.write(p,p.relative_to(temp))
-                if zip_i == 1 or zip_i == zip_total or zip_i % max(1,zip_total//100) == 0:
-                    _progress(96 + 4*(zip_i/zip_total), f'Packaging file {zip_i:,} of {zip_total:,}…')
+        fd,temp_zip_name=tempfile.mkstemp(prefix=f'.{out_zip.stem}.',suffix='.zip.tmp',dir=out_zip.parent)
+        os.close(fd)
+        temp_zip=Path(temp_zip_name)
+        try:
+            with zipfile.ZipFile(temp_zip,'w',zipfile.ZIP_DEFLATED) as z:
+                for zip_i,p in enumerate(zip_files,start=1):
+                    z.write(p,p.relative_to(temp))
+                    if zip_i == 1 or zip_i == zip_total or zip_i % max(1,zip_total//100) == 0:
+                        _progress(96 + 4*(zip_i/zip_total), f'Packaging file {zip_i:,} of {zip_total:,}…')
+            os.replace(temp_zip,out_zip)
+        except PermissionError as exc:
+            raise PermissionError(
+                f'Cannot write output ZIP: {out_zip}\n\n'
+                'Close the ZIP in Explorer, Axion, or any other program, then run the conversion again.'
+            ) from exc
+        finally:
+            temp_zip.unlink(missing_ok=True)
         _progress(100, 'Conversion complete')
         return dict(codes=len(codes),pictograms=pic_count,mono_pictograms=mono_count,color_pictograms=color_count,
                     msg_rows=len(msg_rows),seq_rows=len(seq_rows),console_rows=len(odk_rows),unrepresentable=unrepresentable,
@@ -6200,6 +6373,149 @@ def _suggest_output_path(ips: Path) -> Path:
         return ips.with_name(f'{ips.stem}_to_Axion.zip')
     except Exception:
         return Path.cwd() / 'Axion_conversion.zip'
+
+
+def _ips_matrix_signs(ips:Path)->List[Dict[str,Any]]:
+    core=_load_renderer(); database=core.Jet3Reader(ips)
+    sign_table=database.find_table('LSignID','LSignName','LSignDotHeight','LSignDotWidth')
+    physical={}
+    for table in database.tables.values():
+        if {'LSignID','PSignID','PSignAddr'} <= {column.name for column in table.cols}:
+            for row in database.rows(table):
+                physical[int(row['LSignID'])]=(row.get('PSignID') or '',row.get('PSignAddr') or '')
+    out=[]
+    for row in database.rows(sign_table):
+        name=str(row.get('LSignName') or '')
+        if _is_odk_sign(name,row.get('LSignDotWidth'),row.get('LSignDotHeight')): continue
+        sign_id=int(row['LSignID']); physical_id,physical_address=physical.get(sign_id,('',''))
+        out.append(dict(id=sign_id,name=name,width=int(row['LSignDotWidth']),height=int(row['LSignDotHeight']),
+                        physical_id=physical_id,physical_address=physical_address))
+    return out
+
+
+def _suggest_axion_sign_mappings(signs:List[Dict[str,Any]]):
+    """Return automatic source/location suggestions and selectable Axion profiles."""
+    with tempfile.TemporaryDirectory(prefix='lum2axion_mapping_') as temp_dir:
+        dbdir,_=_extract_builtin_template(Path(temp_dir))
+        specs=[dict(id=sign['id'],name=sign['name'],width=sign['width'],height=sign['height'],is_color=False) for sign in signs]
+        sign_to_src,_,_=ensure_axion_displays(dbdir,specs)
+        sources={source['src']:source for source in inspect_template(dbdir)}
+        profiles=DbfTemplate(_ci(dbdir,'Affichrs.DBF')).active_records()
+        locations=[str(row.get('EMPL') or '') for row in DbfTemplate(_ci(dbdir,'Emplacem.DBF')).active_records()]
+    suggestions={sign_id:sources[source_id] for sign_id,source_id in sign_to_src.items()}
+    return suggestions,profiles,locations
+
+
+def _edit_sign_mappings(parent, ips:Path):
+    """Return Axion overrides keyed by IPS LSignID, or None if conversion is cancelled."""
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+
+    signs=_ips_matrix_signs(ips); suggestions,profiles,locations=_suggest_axion_sign_mappings(signs); result={'value':None}
+    dialog=tk.Toplevel(parent); dialog.title('Map IPS Signs to Axion Displays')
+    dialog.geometry('1240x500'); dialog.minsize(980,400); dialog.transient(parent); dialog.grab_set()
+    ttk.Label(dialog,text='IPS physical address is reference-only. Axion assigns signs by display profile, location, and source ID; blank profile address/type remain automatic.').pack(anchor='w',padx=12,pady=(12,6))
+    columns=('ips','physical','size','disposition','display','location','source','address','type')
+    tree=ttk.Treeview(dialog,columns=columns,show='headings',selectmode='browse')
+    headings=('IPS logical sign','IPS physical sign','Size','Disposition','Axion display','Axion location','Source ID','Profile address','Type')
+    widths=(160,115,65,85,235,140,75,100,50)
+    for column,heading,width in zip(columns,headings,widths):
+        tree.heading(column,text=heading); tree.column(column,width=width,anchor='center' if column!='ips' else 'w',stretch=column=='ips')
+    scroll=ttk.Scrollbar(dialog,orient='vertical',command=tree.yview); tree.configure(yscrollcommand=scroll.set)
+    tree.pack(side='left',fill='both',expand=True,padx=(12,0),pady=6); scroll.pack(side='left',fill='y',padx=(0,12),pady=6)
+    profile_by_id={int(profile['AFF_ID']):profile for profile in profiles if profile.get('AFF_ID') is not None}
+    def profile_label(profile):
+        return f"{profile['AFF_ID']}: {profile['AFF_NAME']} ({profile['DIMH']}x{profile['DIMV']})"
+    for sign in signs:
+        suggestion=suggestions[sign['id']]; profile=profile_by_id[suggestion['aff']]
+        tree.insert('', 'end',iid=str(sign['id']),values=(
+            f"L{sign['id']} {sign['name']}",f"P{sign['physical_id']} / {sign['physical_address']}",f"{sign['width']}x{sign['height']}",
+            'Convert',f"Auto: {profile_label(profile)}",suggestion['location'],suggestion['src'],'',''))
+
+    source_choices=tuple(str(value) for value in range(1,100))
+    address_choices=('',)+tuple(sorted({str(profile.get('ADRIDENTIF') or '').upper() for profile in profiles if profile.get('ADRIDENTIF')}))
+    editable={'disposition','display','location','source','address','type'}
+    active_editor={'widget':None}
+
+    def finish_edit(event=None):
+        editor=active_editor['widget']
+        if not editor:
+            return
+        item,column=editor.item,editor.column
+        value=editor.get().strip()
+        values=list(tree.item(item,'values'))
+        index=columns.index(column)
+        values[index]=value
+        if column=='display' and value:
+            profile=next((profile for profile in profiles if profile_label(profile)==value),None)
+            if profile:
+                values[columns.index('address')]=profile['ADRIDENTIF']
+                values[columns.index('type')]=profile['TYPE']
+        tree.item(item,values=values)
+        editor.destroy(); active_editor['widget']=None
+
+    def begin_edit(event):
+        if active_editor['widget']:
+            finish_edit()
+        item=tree.identify_row(event.y); column_id=tree.identify_column(event.x)
+        if not item or not column_id:
+            return
+        column=columns[int(column_id[1:])-1]
+        if column not in editable:
+            return
+        tree.selection_set(item)
+        x,y,width,height=tree.bbox(item,column_id)
+        values=list(tree.item(item,'values'))
+        current=values[columns.index(column)]
+        if column=='disposition':
+            choices=('Convert','Discard')
+        elif column=='display':
+            sign=next(sign for sign in signs if str(sign['id'])==item)
+            choices=('Auto',)+tuple(profile_label(profile) for profile in profiles if (int(profile.get('DIMH') or 0),int(profile.get('DIMV') or 0))==(sign['width'],sign['height']))
+            if current.startswith('Auto: '): current='Auto'
+        elif column=='location':
+            choices=tuple(locations)
+        elif column=='source':
+            choices=source_choices
+        elif column=='address':
+            choices=address_choices
+        else:
+            choices=('','C','H','M','P','S')
+        editor=ttk.Combobox(tree,values=choices,state='readonly')
+        editor.item=item; editor.column=column
+        editor.place(x=x,y=y,width=width,height=height)
+        editor.set(current); editor.focus_set()
+        editor.bind('<<ComboboxSelected>>',finish_edit)
+        editor.bind('<FocusOut>',finish_edit)
+        active_editor['widget']=editor
+
+    tree.bind('<Double-1>',begin_edit)
+    buttons=ttk.Frame(dialog); buttons.pack(fill='x',padx=12,pady=(0,12))
+    def proceed():
+        finish_edit()
+        overrides={}; sources={}
+        for sign in signs:
+            values=tree.item(str(sign['id']),'values'); disposition,display_label,location,source,address,display_type=values[3:]
+            if disposition=='Discard':
+                overrides[sign['id']]=dict(discard=True)
+                continue
+            if source and (not source.isdigit() or int(source)<1):
+                messagebox.showerror('Invalid source ID','Source ID must be a positive whole number.',parent=dialog); return
+            if address and (len(address)!=2 or any(ch not in '0123456789ABCDEF' for ch in address)):
+                messagebox.showerror('Invalid address','Profile address must be two hexadecimal characters.',parent=dialog); return
+            if source:
+                if source in sources:
+                    messagebox.showerror('Duplicate source ID',f'Axion source ID {source} is assigned to L{sources[source]} and L{sign["id"]}.',parent=dialog); return
+                sources[source]=sign['id']
+            profile=next((profile for profile in profiles if profile_label(profile)==display_label),None)
+            display='' if display_label.startswith('Auto') else str(profile['AFF_ID']) if profile else ''
+            if source or location or display or address or display_type: overrides[sign['id']]=dict(source=source,location=location,display=display,address=address,type=display_type)
+        result['value']=overrides; dialog.destroy()
+    ttk.Button(buttons,text='Cancel',command=dialog.destroy).pack(side='right')
+    ttk.Button(buttons,text='Continue',command=proceed).pack(side='right',padx=(0,8))
+    if signs: tree.selection_set(str(signs[0]['id']))
+    parent.wait_window(dialog)
+    return result['value']
 
 
 def launch_gui(initial_ips: Optional[Path]=None):
@@ -6221,7 +6537,6 @@ def launch_gui(initial_ips: Optional[Path]=None):
 
     ips_var=tk.StringVar(value=str(initial_ips or ''))
     out_var=tk.StringVar(value=str(_suggest_output_path(initial_ips)) if initial_ips else '')
-    cls_var=tk.IntVar(value=3)
     sec_var=tk.IntVar(value=2)
     status_var=tk.StringVar(value='Ready')
     progress_var=tk.DoubleVar(value=0.0)
@@ -6250,11 +6565,9 @@ def launch_gui(initial_ips: Optional[Path]=None):
 
     opts=ttk.LabelFrame(outer,text='Conversion options',padding=10)
     opts.grid(row=3,column=0,columnspan=3,sticky='ew',padx=10,pady=(10,8))
-    for c in range(4): opts.columnconfigure(c,weight=1 if c in (1,3) else 0)
-    ttk.Label(opts,text='Message class').grid(row=0,column=0,sticky='w',padx=6,pady=5)
-    ttk.Spinbox(opts,from_=1,to=99,textvariable=cls_var,width=8).grid(row=0,column=1,sticky='w',padx=6,pady=5)
-    ttk.Label(opts,text='Exposure seconds').grid(row=0,column=2,sticky='w',padx=6,pady=5)
-    ttk.Spinbox(opts,from_=1,to=99,textvariable=sec_var,width=8).grid(row=0,column=3,sticky='w',padx=6,pady=5)
+    opts.columnconfigure(1,weight=1)
+    ttk.Label(opts,text='Exposure seconds').grid(row=0,column=0,sticky='w',padx=6,pady=5)
+    ttk.Spinbox(opts,from_=1,to=99,textvariable=sec_var,width=8).grid(row=0,column=1,sticky='w',padx=6,pady=5)
 
     note=ttk.Label(outer,text='Axion template is built in. Every non-ODK logical sign is converted as its own display source and exact sign sizes are created/reused automatically. ODK becomes 20-character Control Console text. Monochrome signs use PICTOGRAM\\*.PIC; multi-color signs use indexed BMPs in PICTOGRAM\\ColorSignPictogram\\.',wraplength=700,foreground='#555555')
     note.grid(row=4,column=0,columnspan=3,sticky='w',padx=10,pady=(0,8))
@@ -6299,14 +6612,17 @@ def launch_gui(initial_ips: Optional[Path]=None):
             if not ips.is_file(): raise ValueError('Select a valid Luminator .ips file.')
             if not out.name: raise ValueError('Choose an output ZIP path.')
             if out.suffix.lower()!='.zip': out=out.with_suffix('.zip'); out_var.set(str(out))
-            mc=int(cls_var.get()); secs=int(sec_var.get())
+            secs=int(sec_var.get())
             if secs<1: raise ValueError('Exposure seconds must be at least 1.')
         except Exception as e:
             messagebox.showerror('Invalid settings',str(e)); return
+        sign_overrides=_edit_sign_mappings(root,ips)
+        if sign_overrides is None:
+            return
         run_btn.configure(state='disabled'); progress_var.set(0.0); percent_var.set('0%'); status_var.set('Starting…')
         append(f'IPS: {ips}'); append('Axion template: embedded')
         append(f'Output: {out}')
-        append(f'Options: class={mc}, seconds={secs}, indexes=rebuild')
+        append(f'Options: classes=B/C, seconds={secs}, indexes=rebuild')
         append('Rendering signs and building Axion database…')
         def gui_progress(value,message=''):
             value=max(0.0,min(100.0,float(value)))
@@ -6319,7 +6635,7 @@ def launch_gui(initial_ips: Optional[Path]=None):
 
         def worker():
             try:
-                st=convert(ips,out,msg_class=mc,seconds=secs,index_mode='rebuild',progress_callback=gui_progress)
+                st=convert(ips,out,seconds=secs,sign_overrides=sign_overrides,index_mode='rebuild',progress_callback=gui_progress)
                 root.after(0,lambda:finish_ok(st,out))
             except Exception:
                 t=traceback.format_exc(); root.after(0,lambda:finish_err(t))
@@ -6341,12 +6657,11 @@ def main(argv=None):
     ap=argparse.ArgumentParser(description='Convert a Luminator IPS to an Axion/DataTransit database using the built-in template')
     ap.add_argument('ips',type=Path)
     ap.add_argument('-o','--output',type=Path,required=True)
-    ap.add_argument('--message-class',type=int,default=3)
     ap.add_argument('--seconds',type=int,default=2)
     ap.add_argument('--side',choices=['SIDE1','SIDE2'],help=argparse.SUPPRESS)  # legacy; all logical signs are converted
     ap.add_argument('--index-mode',choices=['rebuild','remove','preserve'],default='rebuild',help=argparse.SUPPRESS)
     a=ap.parse_args(argv)
-    st=convert(a.ips,a.output,msg_class=a.message_class,seconds=a.seconds,index_mode=a.index_mode)
+    st=convert(a.ips,a.output,seconds=a.seconds,index_mode=a.index_mode)
     print('Converted:',st)
     return 0
 

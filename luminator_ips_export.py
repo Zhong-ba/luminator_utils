@@ -832,6 +832,7 @@ def build_export(ips: Path, outdir: Path, all_frames: bool=True, scale: int=1, e
         frame_suffix = '' if exp_idx == 1 else f'__exp{exp_idx:02d}'
         multi_same_size=len(uniq)>1
         for key,img,sign in uniq:
+            lsid=key[2]
             sign_suffix=f"__{safe_name(sign['LSignName'])}" if multi_same_size else ''
             fn=f'{code}{class_suffix}{sign_suffix}{frame_suffix}.png'
             dest=folder/fn
@@ -839,7 +840,7 @@ def build_export(ips: Path, outdir: Path, all_frames: bool=True, scale: int=1, e
                 img=img.resize((w*scale,h*scale),Image.Resampling.NEAREST)
             img.save(dest, optimize=False)
             files.append(dest)
-            manifest_rows.append((dest.relative_to(outdir).as_posix(), cls, code, sign['LSignName'], w, h, frame, exposure_index[key]))
+            manifest_rows.append((dest.relative_to(outdir).as_posix(), cls, code, lsid, sign['LSignName'], w, h, frame, exposure_index[key]))
 
     # Export the database Graphics library independently of message usage.
     graphic_files=[]
@@ -864,9 +865,9 @@ def build_export(ips: Path, outdir: Path, all_frames: bool=True, scale: int=1, e
     _progress(96, 'Writing manifest…')
     manifest=outdir/'manifest.tsv'
     with manifest.open('w',encoding='utf-8',newline='') as f:
-        f.write('relative_path\tmsg_class\tmsg_code\tlogical_sign\twidth\theight\tframe\texposure\n')
-        for rel,cls,code,sign_name,w,h,frame,exposure in manifest_rows:
-            f.write(f"{rel}\t{cls}\t{code}\t{sign_name}\t{w}\t{h}\t{frame}\t{exposure}\n")
+        f.write('relative_path\tmsg_class\tmsg_code\tlogical_sign_id\tlogical_sign\twidth\theight\tframe\texposure\n')
+        for rel,cls,code,sign_id,sign_name,w,h,frame,exposure in manifest_rows:
+            f.write(f"{rel}\t{cls}\t{code}\t{sign_id}\t{sign_name}\t{w}\t{h}\t{frame}\t{exposure}\n")
 
     message_list_rows=0
     message_list_path=None
