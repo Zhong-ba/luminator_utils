@@ -37,4 +37,20 @@ the first exposure for each sign.
 py luminator_to_axion.py path\to\signs.ips -o output_database
 ```
 
+Arguments:
+
+| Argument | Description |
+| --- | --- |
+| `ips` | Required path to the source IPS database. |
+| `-o`, `--output` | Required path for the generated Axion/DataTransit database. |
+| `--seconds SECONDS` | Exposure duration in seconds. Defaults to `2`. |
+| `--network-name NAME` | Axion network name, up to 20 characters. Defaults to the IPS filename stem. |
+| `--system-name NAME` | Axion system name, up to 20 characters. Defaults to the IPS filename stem. |
+| `--index-mode {rebuild,remove,preserve}` | Index handling mode. Defaults to `rebuild`. |
+| `--gui` | Opens the desktop interface. With no other arguments, running the script also opens the interface. |
+
 Running the script without arguments opens its desktop interface.
+
+Class-A special messages are selected by code:
+Code 2 converts to Axion `ZZZZ` (emergency), and code 21 converts to `$YLD` (yield). Only codes present in the source frame table are included. Other class-A codes are not converted. Axion numeric IDs 9998 and 9997 are converter-assigned output
+values, not IPS input codes.
